@@ -1,0 +1,483 @@
+/**
+ * ByTune Android — Phase 0 proof screen.
+ *
+ * Proves on device:
+ *   1. One streamed YouTube track plays (youtubei.js in a hidden WebView,
+ *      PO tokens minted there, native byte-range streaming via FFmpeg).
+ *   2. Keeps playing with the screen off ≥ 10 min (foreground service).
+ *   3. Lock-screen / notification controls work.
+ *   4. A test EQ band (peaking, +12 dB @ 1 kHz) is audibly active.
+ *
+ * This screen is throwaway scaffolding; Phase 1 replaces it with the real UI.
+ */
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  ActivityIndicator,
+  PermissionsAndroid,
+  Platform,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { WebView } from 'react-native-webview';
+import { Asset } from 'expo-asset';
+import * as FileSystem from 'expo-file-system/legacy';
+import {
+  Audio,
+  AudioContext,
+  PlaybackNotificationManager,
+  useAudioTagContext,
+  type AudioTagHandle,
+} from 'react-native-audio-api';
+
+/**
+ * react-native-webview 14's class types collapse to `never` under
+ * RN 0.88/TS 5.9 (`WebViewProps & undefined`). Runtime is unaffected; this
+ * shim just restores usable JSX typing until upstream fixes it.
+ */
+const WebViewAny = WebView as unknown as React.ComponentType<any>;
+
+/* Same desktop Chrome UA the desktop app presents to YouTube; keeps the
+   homepage/att-get challenge markup identical to the Electron flow. */
+const DESKTOP_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+/** A universally available music video for the streaming proof. */
+const TEST_TRACK = {
+  id: 'dQw4w9WgXcQ',
+  title: 'Never Gonna Give You Up',
+  artist: 'Rick Astley',
+  artwork: 'https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg',
+};
+
+interface ResolvedInfo {
+  url: string;
+  mime: string;
+  lufs: number | null;
+  itag?: number;
+  clen?: number;
+  client: string;
+}
+
+export default function App(): React.JSX.Element {
+  const [html, setHtml] = useState<string | null>(null);
+  const [logs, setLogs] = useState<string[]>([]);
+  const [resolved, setResolved] = useState<ResolvedInfo | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const [eqOn, setEqOn] = useState(false);
+  const [position, setPosition] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [ctxReady, setCtxReady] = useState(false);
+  const [fatalError, setFatalError] = useState<string | null>(null);
+
+  const webViewRef = useRef<any>(null);
+  const handleRef = useRef<AudioTagHandle>(null);
+  const ctxRef = useRef<AudioContext | null>(null);
+  const masterGainRef = useRef<import('react-native-audio-api').GainNode | null>(null);
+  const eqRef = useRef<import('react-native-audio-api').BiquadFilterNode | null>(null);
+  const routedRef = useRef<boolean>(false);
+  const playingRef = useRef(false);
+  const positionRef = useRef(0);
+  const lastNotificationUpdateRef = useRef(0);
+
+  const log = useCallback((m: string) => {
+    const time = new Date().toLocaleTimeString();
+    setLogs((prev) => [...prev.slice(-120), `[${time}] ${m}`]);
+  }, []);
+
+  const inject = useCallback((msg: unknown) => {
+    webViewRef.current?.injectJavaScript(`window.__rnMessage(${JSON.stringify(msg)});true;`);
+  }, []);
+
+  // Load the brain HTML asset (bundled into the APK).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const asset = Asset.fromModule(require('./assets/brain.html.txt'));
+        await asset.downloadAsync();
+        const text = await FileSystem.readAsStringAsync(asset.localUri ?? asset.uri);
+        if (!cancelled) setHtml(text);
+      } catch (err: any) {
+        if (!cancelled) setFatalError(`brain asset failed: ${err?.message ?? err}`);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Audio engine: one context + master gain for the whole app.
+  useEffect(() => {
+    const ctx = new AudioContext();
+    ctxRef.current = ctx;
+    const master = ctx.createGain();
+    master.gain.value = 1;
+    master.connect(ctx.destination);
+    masterGainRef.current = master;
+    setCtxReady(true);
+    return () => {
+      try {
+        void ctx.close();
+      } catch {
+        /* ignore */
+      }
+      ctxRef.current = null;
+    };
+  }, []);
+
+  const notify = useCallback(async (update: Record<string, unknown>) => {
+    try {
+      await PlaybackNotificationManager.show({
+        title: TEST_TRACK.title,
+        artist: TEST_TRACK.artist,
+        artwork: { uri: TEST_TRACK.artwork },
+        duration: duration || undefined,
+        skipInterval: 10,
+        ...update,
+      } as any);
+    } catch {
+      /* notification errors are surfaced by the lock-screen test itself */
+    }
+  }, [duration]);
+
+  // Notification/lock-screen controls (Phase 0 gate #3).
+  useEffect(() => {
+    const subs = [
+      PlaybackNotificationManager.addEventListener('playbackNotificationPlay', () => {
+        setPlaying(true);
+      }),
+      PlaybackNotificationManager.addEventListener('playbackNotificationPause', () => {
+        setPlaying(false);
+      }),
+      PlaybackNotificationManager.addEventListener('playbackNotificationSkipForward', (e: any) => {
+        const target = positionRef.current + (e?.value ?? 10);
+        handleRef.current?.seekToTime(target);
+      }),
+      PlaybackNotificationManager.addEventListener('playbackNotificationSkipBackward', (e: any) => {
+        const target = positionRef.current - (e?.value ?? 10);
+        handleRef.current?.seekToTime(Math.max(0, target));
+      }),
+      PlaybackNotificationManager.addEventListener('playbackNotificationSeekTo', (e: any) => {
+        if (typeof e?.value === 'number') handleRef.current?.seekToTime(e.value);
+      }),
+    ];
+    return () => subs.forEach((s) => s?.remove());
+  }, []);
+
+  useEffect(() => {
+    playingRef.current = playing;
+    if (!resolved) return;
+    void notify({ state: playing ? 'playing' : 'paused', elapsedTime: positionRef.current });
+  }, [playing, resolved, notify]);
+
+  const onBrainMessage = useCallback(
+    (event: { nativeEvent: { data: string } }) => {
+      let msg: any;
+      try {
+        msg = JSON.parse(event.nativeEvent.data);
+      } catch {
+        return;
+      }
+      switch (msg.t) {
+        case 'log':
+          log(`[brain] ${msg.m}`);
+          break;
+        case 'ready':
+          log('[brain] ready — requesting stream…');
+          inject({ t: 'resolve', videoId: TEST_TRACK.id });
+          break;
+        case 'probe': {
+          // Validate from the same network path the native player will use.
+          // Open range on purpose: SABR-gated URLs 403 real streaming
+          // requests while answering tiny ranges with 206.
+          const { rid, url } = msg;
+          void (async () => {
+            const ctrl = new AbortController();
+            let ok = false;
+            let status = 0;
+            try {
+              const res = await fetch(url, { headers: { Range: 'bytes=0-' }, signal: ctrl.signal });
+              status = res.status;
+              ok = res.status === 206 || res.status === 200;
+              ctrl.abort(); // only the status matters; don't pull the file
+            } catch {
+              ok = false;
+            }
+            log(`[probe] ${status} → ${ok ? 'ok' : 'rejected'}`);
+            inject({ t: 'probeResult', rid, ok, status });
+          })();
+          break;
+        }
+        case 'stream':
+          log(`[stream] resolved via ${msg.client} · itag ${msg.itag} · ${msg.mime} · LUFS ${msg.lufs ?? '?'}`);
+          setResolved({
+            url: msg.url,
+            mime: msg.mime,
+            lufs: msg.lufs,
+            itag: msg.itag,
+            clen: msg.clen,
+            client: msg.client,
+          });
+          void (async () => {
+            if (Platform.OS === 'android') {
+              try {
+                await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
+              } catch {
+                /* the lock-screen test will show whether it worked */
+              }
+            }
+            try {
+              await PlaybackNotificationManager.enableControl('play', true);
+              await PlaybackNotificationManager.enableControl('pause', true);
+              await PlaybackNotificationManager.enableControl('skipForward', true);
+              await PlaybackNotificationManager.enableControl('skipBackward', true);
+              await PlaybackNotificationManager.enableControl('seekTo', true);
+              await PlaybackNotificationManager.show({
+                title: TEST_TRACK.title,
+                artist: TEST_TRACK.artist,
+                artwork: { uri: TEST_TRACK.artwork },
+                skipInterval: 10,
+                state: 'paused',
+                elapsedTime: 0,
+              } as any);
+              log('notification controls shown');
+            } catch (err: any) {
+              log(`notification error: ${err?.message ?? err}`);
+            }
+          })();
+          break;
+        case 'error':
+          log(`[brain ERROR] ${msg.stage}: ${msg.message}`);
+          setFatalError(`${msg.stage}: ${msg.message}`);
+          break;
+        default:
+          break;
+      }
+    },
+    [inject, log]
+  );
+
+  // Route the media source through the EQ chain the moment it is loadable
+  // (the Audio tag auto-connects to the destination; createMediaElementSource
+  // re-routes it so the EQ sits in the signal path).
+  const onAudioLoad = useCallback(() => {
+    const ctx = ctxRef.current;
+    const handle = handleRef.current;
+    const master = masterGainRef.current;
+    if (!ctx || !handle || !master || routedRef.current) return;
+    try {
+      const msn = ctx.createMediaElementSource(handle);
+      const eq = ctx.createBiquadFilter();
+      eq.type = 'peaking';
+      eq.frequency.value = 1000;
+      eq.Q.value = 1;
+      eq.gain.value = 0;
+      msn.connect(eq);
+      eq.connect(master);
+      eqRef.current = eq;
+      routedRef.current = true;
+      log('audio graph: source → EQ(1 kHz peaking) → master → output');
+    } catch (err: any) {
+      log(`audio graph error: ${err?.message ?? err}`);
+    }
+  }, []);
+
+  const toggleEq = useCallback(() => {
+    const eq = eqRef.current;
+    if (!eq) return;
+    const next = !eqOn;
+    eq.gain.value = next ? 12 : 0; // +12 dB peaking at 1 kHz — clearly audible
+    setEqOn(next);
+    log(`EQ test band ${next ? 'ON (+12 dB @ 1 kHz)' : 'OFF'}`);
+  }, [eqOn]);
+
+  const togglePlay = useCallback(() => {
+    const handle = handleRef.current;
+    if (!handle) return;
+    if (playingRef.current) {
+      handle.pause();
+      setPlaying(false);
+    } else {
+      handle.play();
+      setPlaying(true);
+    }
+  }, []);
+
+  const seekBy = useCallback((delta: number) => {
+    const handle = handleRef.current;
+    if (!handle) return;
+    const target = Math.max(0, positionRef.current + delta);
+    handle.seekToTime(target);
+    positionRef.current = target;
+    setPosition(target);
+  }, []);
+
+  const onPositionChange = useCallback(
+    (seconds: number) => {
+      positionRef.current = seconds;
+      setPosition(seconds);
+      const now = Date.now();
+      if (now - lastNotificationUpdateRef.current > 1000 && playingRef.current) {
+        lastNotificationUpdateRef.current = now;
+        void notify({ elapsedTime: seconds, state: 'playing' });
+      }
+    },
+    [notify]
+  );
+
+  const fmt = (s: number): string => {
+    if (!Number.isFinite(s)) return '–:––';
+    const m = Math.floor(s / 60);
+    return `${m}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+  };
+
+  const phase = !html
+    ? 'loading brain…'
+    : !resolved
+      ? 'resolving stream…'
+      : playing
+        ? 'playing'
+        : 'paused / ready';
+
+  return (
+    <View style={styles.root}>
+      {/* The hidden brain: a 1px WebView whose document origin is youtube.com */}
+      {html ? (
+        <View style={styles.brainHost} pointerEvents="none">
+          <WebViewAny
+            ref={webViewRef}
+            source={{ html, baseUrl: 'https://www.youtube.com' }}
+            originWhitelist={['https://*']}
+            userAgent={DESKTOP_UA}
+            javaScriptEnabled
+            domStorageEnabled
+            mediaPlaybackRequiresUserAction={false}
+            onMessage={onBrainMessage}
+            onLoadEnd={() => {
+              log('brain webview loaded — sending start');
+              inject({ t: 'start' });
+            }}
+            onError={(e: any) => log(`webview error: ${e?.nativeEvent?.description ?? e}`)}
+            style={styles.brain}
+          />
+        </View>
+      ) : null}
+
+      <Text style={styles.title}>ByTune — Phase 0 proof</Text>
+      <Text style={styles.phase}>
+        {phase} {phase === 'resolving stream…' ? <ActivityIndicator size="small" color="#8ab4f8" /> : null}
+      </Text>
+
+      {resolved ? (
+        <>
+          {ctxReady ? (
+            <Audio
+              ref={handleRef}
+              context={ctxRef.current!}
+              source={{ uri: resolved.url }}
+              preload="auto"
+              autoPlay={false}
+              onLoad={onAudioLoad}
+              onError={(e: any) => log(`audio error: ${e?.message ?? e}`)}
+              onPositionChange={onPositionChange}
+              onEnded={() => {
+                setPlaying(false);
+                log('track ended');
+              }}
+              onWaiting={() => log('buffering…')}
+              onPlaying={() => log('playing (resumed from stall)')}
+            >
+              <DurationProbe onDuration={(d) => setDuration(d)} />
+            </Audio>
+          ) : null}
+
+          <Text style={styles.track}>
+            {TEST_TRACK.title} — {TEST_TRACK.artist}
+          </Text>
+          <Text style={styles.info}>
+            via {resolved.client} · itag {resolved.itag} · {resolved.mime} · LUFS {resolved.lufs ?? '?'}
+          </Text>
+          <Text style={styles.position}>
+            {fmt(position)} / {fmt(duration)}
+          </Text>
+
+          <View style={styles.row}>
+            <TouchableOpacity style={styles.btn} onPress={() => seekBy(-10)}>
+              <Text style={styles.btnText}>−10s</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.btn, styles.primary]} onPress={togglePlay}>
+              <Text style={[styles.btnText, styles.primaryText]}>{playing ? 'Pause' : 'Play'}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.btn} onPress={() => seekBy(10)}>
+              <Text style={styles.btnText}>+10s</Text>
+            </TouchableOpacity>
+          </View>
+          <TouchableOpacity style={[styles.btn, eqOn && styles.eqOn]} onPress={toggleEq}>
+            <Text style={[styles.btnText, eqOn && styles.eqOnText]}>
+              EQ test band {eqOn ? 'ON (+12 dB @ 1 kHz)' : 'OFF'}
+            </Text>
+          </TouchableOpacity>
+          <Text style={styles.hint}>
+            Gate 2: press Play, turn the screen off, wait 10+ minutes — music must keep going and the
+            lock screen must show controls (test past Android's ~3 min cutoff).{'\n'}
+            Gate 4: toggle the EQ band during playback — the sound must change audibly.
+          </Text>
+        </>
+      ) : (
+        <Text style={styles.hint}>Waiting for the stream… {fatalError ? '' : 'this can take ~30 s (PO token minting).'}</Text>
+      )}
+
+      {fatalError ? <Text style={styles.error}>FAILED: {fatalError}</Text> : null}
+
+      <ScrollView style={styles.logBox}>
+        {logs.map((l, i) => (
+          <Text key={i} style={styles.logLine}>
+            {l}
+          </Text>
+        ))}
+      </ScrollView>
+    </View>
+  );
+}
+
+/** Lifts the tag's duration out of the <Audio> context. */
+function DurationProbe({ onDuration }: { onDuration: (d: number) => void }): null {
+  const ctx = useAudioTagContext();
+  const last = useRef(0);
+  if (ctx.duration && ctx.duration !== last.current) {
+    last.current = ctx.duration;
+    onDuration(ctx.duration);
+  }
+  return null;
+}
+
+const styles = StyleSheet.create({
+  root: { flex: 1, backgroundColor: '#0b0e14', paddingTop: 48, paddingHorizontal: 16 },
+  brainHost: { position: 'absolute', top: 0, left: 0, width: 1, height: 1, opacity: 0.01 },
+  brain: { width: 1, height: 1 },
+  title: { color: '#f1f3f4', fontSize: 20, fontWeight: '700' },
+  phase: { color: '#8ab4f8', marginTop: 4, marginBottom: 12 },
+  track: { color: '#f1f3f4', fontSize: 18, fontWeight: '600' },
+  info: { color: '#9aa0a6', marginTop: 2 },
+  position: { color: '#f1f3f4', fontSize: 15, marginTop: 6 },
+  row: { flexDirection: 'row', gap: 10, marginTop: 16, justifyContent: 'center' },
+  btn: {
+    backgroundColor: '#1e2430',
+    borderRadius: 10,
+    paddingHorizontal: 18,
+    paddingVertical: 12,
+    marginTop: 10,
+  },
+  primary: { backgroundColor: '#3c5aff', marginTop: 10 },
+  btnText: { color: '#f1f3f4', fontSize: 15, fontWeight: '600' },
+  primaryText: { color: '#ffffff' },
+  eqOn: { backgroundColor: '#264d3f' },
+  eqOnText: { color: '#7ff0b3' },
+  hint: { color: '#9aa0a6', fontSize: 12, marginTop: 14, lineHeight: 17 },
+  error: { color: '#ff8a80', marginTop: 10, fontWeight: '700' },
+  logBox: { flex: 1, marginTop: 12, borderTopWidth: 1, borderTopColor: '#232833' },
+  logLine: { color: '#8b93a1', fontSize: 11, paddingVertical: 1 },
+});

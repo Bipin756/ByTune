@@ -1,0 +1,50 @@
+{
+  "expo": {
+    "name": "ByTune",
+    "slug": "bytune-mobile",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "space.bytune.mobile"
+    },
+    "android": {
+      "package": "space.bytune.music",
+      "versionCode": 1,
+      "adaptiveIcon": {
+        "backgroundColor": "#0b0e14",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "react-native-audio-api",
+        {
+          "androidPermissions": [
+            "android.permission.FOREGROUND_SERVICE",
+            "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+            "android.permission.POST_NOTIFICATIONS",
+            "android.permission.MODIFY_AUDIO_SETTINGS",
+            "android.permission.INTERNET"
+          ],
+          "androidForegroundService": true,
+          "androidFSTypes": [
+            "mediaPlayback"
+          ],
+          "androidFSStopWithTask": true,
+          "enableFFmpeg": true
+        }
+      ],
+      "expo-dev-client",
+      "expo-asset"
+    ]
+  }
+}

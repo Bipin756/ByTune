@@ -1,0 +1,48 @@
+/**
+ * Builds the WebView brain bundle: mobile/src/brain/brain.ts →
+ * mobile/assets/brain.html.txt (a full HTML document with the minified IIFE
+ * inlined). The RN app reads this text asset and passes it to the WebView as
+ * `source={{ html, baseUrl: 'https://www.youtube.com' }}`.
+ *
+ * Run before every APK build: `npm run build:brain`.
+ */
+import esbuild from 'esbuild';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const mobileRoot = join(here, '..');
+
+const result = await esbuild.build({
+  entryPoints: [join(mobileRoot, 'src', 'brain', 'brain.ts')],
+  bundle: true,
+  format: 'iife',
+  platform: 'browser',
+  target: ['es2019'],
+  minify: true,
+  write: false,
+  logLevel: 'info',
+});
+
+const js = result.outputFiles[0].text;
+// A "</script>" inside the bundle would close the tag early — escape it.
+const safeJs = js.replace(/<\/script/gi, '<\\/script');
+
+const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ByTune brain</title>
+</head>
+<body>
+<script>${safeJs}</script>
+</body>
+</html>
+`;
+
+const outDir = join(mobileRoot, 'assets');
+mkdirSync(outDir, { recursive: true });
+writeFileSync(join(outDir, 'brain.html.txt'), html);
+console.log(`brain bundle: ${(html.length / 1024).toFixed(0)} KB → mobile/assets/brain.html.txt`);
