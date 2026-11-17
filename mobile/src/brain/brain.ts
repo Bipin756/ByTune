@@ -37,6 +37,12 @@ import { buildURL, parseLooseJSON } from 'bgutils-js/utils';
 // Function, so provide it here (the desktop app does the same inside JSDOM).
 (Platform as any).shim.eval = async (data: any) => new Function(data.output)();
 
+// web.js registers `fetch: globalThis.fetch` — the raw, DETACHED function.
+// Chrome requires fetch to be invoked with window as its receiver ("Illegal
+// invocation" otherwise), and some youtubei.js code paths call it detached.
+// Route every fetch through an arrow so the receiver is always correct.
+(Platform as any).shim.fetch = (input: any, init?: any) => globalThis.fetch(input, init);
+
 const REQUEST_KEY = 'O43z0dpjhgX20SCx4KAo';
 const GOOG_API_KEY = 'AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw';
 const TOKEN_TTL_MS = 3 * 60 * 60 * 1000;
