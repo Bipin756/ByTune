@@ -93,17 +93,30 @@ function waaHeaders(): Record<string, string> {
 let fullSession: Innertube | null = null;
 let poToken: string | undefined;
 let mintedAt = 0;
+/** ytcfg parsed from the last homepage fetch (contains VISITOR_DATA). */
+let homepageYtcfg: Record<string, any> | null = null;
 
-function visitorDataOf(yt: Innertube): string {
-  const vd = (yt as any)?.session?.context?.client?.visitor_data;
-  if (typeof vd !== 'string' || !vd) throw new Error('session has no visitor_data');
-  return vd;
+function visitorDataOf(yt: Innertube): { vd: string; source: string } {
+  // Primary: the session's own context (desktop: music-service.ts phase 1).
+  const fromSession = (yt as any)?.session?.context?.client?.visitorData;
+  if (typeof fromSession === 'string' && fromSession) {
+    return { vd: fromSession, source: 'session' };
+  }
+  // Fallback 1: VISITOR_DATA from the homepage ytcfg (same document origin).
+  const fromYtcfg = homepageYtcfg?.VISITOR_DATA;
+  if (typeof fromYtcfg === 'string' && fromYtcfg) {
+    return { vd: fromYtcfg, source: 'homepage ytcfg' };
+  }
+  throw new Error('no visitor data in session or homepage ytcfg');
 }
 
 async function createBaseSession(): Promise<Innertube> {
   // Same first phase as the desktop: a light session just to obtain
   // visitor data for token minting.
-  return await Innertube.create({ retrieve_player: false });
+  return await Innertube.create({
+    retrieve_player: false,
+    enable_session_cache: false,
+  });
 }
 
 async function createFullSession(visitorData: string, token: string): Promise<Innertube> {
@@ -115,24 +128,39 @@ async function createFullSession(visitorData: string, token: string): Promise<In
   });
 }
 
-/** Challenge pair extracted from the YouTube homepage (same-origin here). */
-async function challengeFromHomepage(): Promise<ChallengeData | undefined> {
+/** Fetch the YouTube homepage once; keeps ytcfg for the visitor-data fallback. */
+let homepageHtml: string | null = null;
+async function ensureHomepage(): Promise<string | null> {
+  if (homepageHtml) return homepageHtml;
   try {
     const res = await fetch('https://www.youtube.com/', {
       credentials: 'omit',
       signal: timeout(CHALLENGE_TIMEOUT_MS),
     });
     const html = await res.text();
-
-    let ytcfg: Record<string, any> | null = null;
+    homepageHtml = html;
     const ytcfgMatch = html.match(/ytcfg\.set\(({.+?})\);/s);
     if (ytcfgMatch) {
       try {
-        ytcfg = JSON.parse(ytcfgMatch[1]);
+        homepageYtcfg = JSON.parse(ytcfgMatch[1]);
       } catch {
-        ytcfg = null;
+        homepageYtcfg = null;
       }
     }
+    return html;
+  } catch (err: any) {
+    log(`homepage fetch failed: ${err?.message ?? err}`);
+    return null;
+  }
+}
+
+/** Challenge pair extracted from the YouTube homepage (same-origin here). */
+async function challengeFromHomepage(): Promise<ChallengeData | undefined> {
+  try {
+    const html = await ensureHomepage();
+    if (!html) return undefined;
+
+    const ytcfg: Record<string, any> | null = homepageYtcfg;
 
     const attMatch = html.match(/window\.ytAtN\(\s*({[\s\S]*?})\s*\)/);
     if (!attMatch) {
@@ -281,10 +309,27 @@ async function mintPoToken(visitorData: string): Promise<string> {
 
 /** Boot the full InnerTube session: visitor data → PO token → real session. */
 async function bootSession(): Promise<void> {
+  // Warm the homepage first: cookies + challenge + ytcfg (VISITOR_DATA fallback).
+  await ensureHomepage();
+
   log('creating base session…');
   const base = await createBaseSession();
-  const visitorData = visitorDataOf(base);
-  log(`visitor data ok (${visitorData.length} chars)`);
+  let visitor: { vd: string; source: string };
+  try {
+    visitor = visitorDataOf(base);
+  } catch (err: any) {
+    log(`session had no visitor data (${err?.message}); retrying with local generation…`);
+    // Last resort: a locally generated visitor id (youtubei.js always
+    // produces one with generate_session_locally). Token binds to it.
+    const local = await Innertube.create({
+      retrieve_player: false,
+      enable_session_cache: false,
+      generate_session_locally: true,
+    });
+    visitor = visitorDataOf(local);
+  }
+  const visitorData = visitor.vd;
+  log(`visitor data ok via ${visitor.source} (${visitorData.length} chars)`);
 
   log('minting PO token…');
   poToken = await mintPoToken(visitorData);
