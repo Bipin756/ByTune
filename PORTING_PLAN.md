@@ -18,7 +18,7 @@
 
 | Phase | Scope | Status |
 |---|---|---|
-| 0 | Proof: streamed YT track plays; keeps playing screen-off ≥10 min (past Android's ~3 min cutoff); lock-screen + notification controls work; a test EQ band is audibly active | **in progress** — app built, awaiting device test |
+| 0 | Proof: streamed YT track plays; keeps playing screen-off ≥10 min (past Android's ~3 min cutoff); lock-screen + notification controls work; a test EQ band is audibly active | **in progress** — release APK built (`app-release.apk`, 100.7 MB); **awaiting owner's on-device test of the 4 gates** |
 | 1 | Core player, search, home feed, queue, synced lyrics, liked songs, playlists, shuffle/repeat, sleep timer, notification/lock-screen controls, Now Playing screen | not started |
 | 2 | Downloads, local music library, Replay stats, accounts + cloud sync (desktop-account compatible), Spotify import | not started |
 | 3 | Rooms, 10-band EQ + presets, crossfade, Automix, skip silence, playback speed, volume leveling, visualizer, remaining mobile equivalents (Android PiP, gestures, etc.) | not started |
@@ -28,11 +28,50 @@
 
 ---
 
+## Build log of Phase 0 (what it took to get a release APK on this machine)
+
+Chronological record of every build blocker, for future sessions:
+
+1. NDK 27.1.12297006 was not installed → Gradle auto-downloads it, but the
+   first attempt was mistakenly killed mid-download (looked "stalled" because
+   progress writes go to the SDK folder, not the Gradle caches). Fix:
+   `sdkmanager "ndk;27.1.12297006"` (clean install).
+2. Interrupted NDK extraction left a corrupt folder (missing
+   `source.properties`) → Gradle failed with `[CXX1101]`. Fix: deleted
+   `%LOCALAPPDATA%\Android\Sdk\ndk\27.1.12297006` and reinstalled via
+   sdkmanager.
+3. **Windows path limits.** `react-native-audio-api`'s CMake mirrors the
+   absolute source path into every object-file name
+   (`CMakeFiles\<target>.dir\C_\<full source path>\...`), doubling path length.
+   - Repo was in `Documents\Default Project` → spaces broke ninja's mkdir.
+     Fix: moved repo (now `C:\dev\ByTune`).
+   - Still failed at exactly 260 chars inside `libs\miniaudio\decoders` even
+     without spaces. Upstream PR #1040 (relative source paths) is already in
+     1.0.1 but doesn't help for out-of-tree `common/` sources. Fix: NTFS
+     junction `C:\dev\ByTune\mobile\node_modules` → `C:\nm\node_modules` (see
+     `mobile/README-mobile.md` for the recipe and the node-realpath nesting
+     subtlety).
+   - Moving the repo/junction invalidates Gradle config caches → clean
+     `mobile/android/.gradle`, `mobile/android/build`, `android/app/build`,
+     and `node_modules/react-native-audio-api/android/.cxx` (the latter needs
+     `cmd /c rd /s /q` — deep paths defeat PowerShell's Remove-Item).
+4. Background shells don't inherit JAVA_HOME/ANDROID_HOME → always set them
+   inside the command that launches Gradle.
+5. First full build takes >60 min on this machine (NDK + FFmpeg + native
+   audio C++). Subsequent builds are ~5 min (only ~34 tasks re-run).
+
+Result: `mobile/android/app/build/outputs/apk/release/app-release.apk`
+(100.7 MB — FFmpeg + native audio libs account for the size), built
+2026-11-17, **not yet installed/tested on device**.
+
+---
+
+
 ## How to resume (for a fresh session)
 
 A fresh assistant session should be able to continue from this file alone.
 
-1. **Repo:** `C:\Users\hp\Documents\Default Project\ByTune` — the owner's fork `Bipin756/ByTune` (upstream: `rishiteja21/ByTune`). The desktop app (root) is untouched; all mobile work is in `mobile/`.
+1. **Repo:** `C:\dev\ByTune` (moved here because Android builds fail on Windows when the path is long or contains spaces — see `mobile/README-mobile.md`) — the owner's fork `Bipin756/ByTune` (upstream: `rishiteja21/ByTune`). The desktop app (root) is untouched; all mobile work is in `mobile/`.
 2. **Read first:** this file top to bottom; then `FEATURE_PARITY.md` (desktop honesty matrix); `docs/ARCHITECTURE.md`; the inventory section below.
 3. **Find current progress:** search this file for `in progress` and `blocked` — do those items first. Then the lowest-numbered phase marked *not started*.
 4. **Build/run:** the Expo app is in `mobile/`. Use `npx expo run:android` (local) or EAS dev-build, per the setup notes in `mobile/README-mobile.md`. JDK 17 + Android SDK are installed on this machine (see `mobile/README-mobile.md` for paths).

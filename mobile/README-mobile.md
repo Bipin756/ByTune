@@ -30,8 +30,30 @@ Porting recipe sources (desktop): `electron/po-token.ts`,
 - Git 2.56, Node 26 LTS, npm 11
 - JDK 17: `C:\Program Files\Eclipse Adoptium\jdk-17.0.21.9-hotspot`
 - Android SDK: `%LOCALAPPDATA%\Android\Sdk` (cmdline-tools, platform-tools,
-  build-tools 35, platform android-36; licenses accepted)
+  build-tools 35, platform android-36, **NDK 27.1.12297006** installed via
+  `sdkmanager "ndk;27.1.12297006"`; licenses accepted)
 - Env vars set (user scope): `JAVA_HOME`, `ANDROID_HOME`, PATH extended
+- **Repo location:** `C:\dev\ByTune` — NOT under Documents. Android builds fail
+  on Windows when the project path is long (`react-native-audio-api`'s CMake
+  mirrors the absolute source path into object-file names, and long paths
+  exceed MAX_PATH). Never move it back into `Documents`.
+- **node_modules junction (required, do not remove):**
+  `C:\dev\ByTune\mobile\node_modules` is an NTFS junction to
+  `C:\nm\node_modules`. Even at `C:\dev`, the C++ build's doubled paths hit the
+  260-char limit inside `react-native-audio-api`; the junction shortens the
+  physical location so they fit. Recreate after moving machines:
+
+  ```powershell
+  New-Item -ItemType Directory -Force C:\nm | Out-Null
+  Move-Item .\mobile\node_modules C:\nm\node_modules
+  New-Item -ItemType Junction -Path .\mobile\node_modules -Target C:\nm\node_modules
+  ```
+
+  Note: node resolves the junction to its real path, so the physical location
+  MUST be nested as `C:\nm\node_modules` (top-level `C:\nm` breaks
+  `require.resolve` upward walks).
+- **Install helper:** `mobile\install-bytune.cmd` — double-click to install the
+  latest release APK over USB.
 
 PowerShell note: `npm.ps1` is blocked by execution policy — always call
 `npm.cmd` / `npx.cmd`.
