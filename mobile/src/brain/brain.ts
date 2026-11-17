@@ -55,10 +55,51 @@ const AUDIO_ITAG_RANK: Record<number, number> = { 141: 6, 251: 5, 140: 4, 250: 3
 
 const CHALLENGE_TIMEOUT_MS = 15_000;
 
+/**
+ * The interpreter script lives on gstatic (cross-origin); browsers refuse to
+ * fetch its TEXT (CORS) but happily EXECUTE it via a script tag, which defines
+ * the BotGuard global directly. Desktop solves this with Electron's
+ * CORS-less fetch; we mirror that with this two-step fallback.
+ */
+async function loadInterpreterScript(url: string): Promise<void> {
+  const abs = url.startsWith('https:') ? url : `https:${url}`;
+  await new Promise<void>((resolve, reject) => {
+    const el = document.createElement('script');
+    el.src = abs;
+    el.onload = () => resolve();
+    el.onerror = () => reject(new Error('interpreter script tag failed'));
+    (document.head || document.documentElement).appendChild(el);
+  });
+}
+
+/**
+ * Returns the interpreter JS text when fetchable, or undefined when it was
+ * (successfully) loaded via a script tag — then the global already exists.
+ */
+async function obtainInterpreterJS(bgChallenge: any): Promise<string | undefined> {
+  const inline = bgChallenge?.interpreterJavascript?.privateDoNotAccessOrElseSafeScriptWrappedValue;
+  if (typeof inline === 'string' && inline) return inline;
+  const urlWrapped = bgChallenge?.interpreterUrl?.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue;
+  if (!urlWrapped) throw new Error('no interpreter available');
+  try {
+    const jsRes = await fetch(`https:${urlWrapped}`, {
+      credentials: 'omit',
+      signal: timeout(CHALLENGE_TIMEOUT_MS),
+    });
+    const text = await jsRes.text();
+    if (text && text.length > 100) return text;
+    throw new Error('interpreter text looked empty');
+  } catch (err: any) {
+    log(`interpreter fetch blocked (${err?.message ?? err}); loading via script tag…`);
+    await loadInterpreterScript(urlWrapped);
+    return undefined;
+  }
+}
+
 interface ChallengeData {
   program: string;
   globalName: string;
-  interpreterJS: string;
+  interpreterJS?: string;
   ytcfg: Record<string, any> | null;
 }
 
@@ -174,19 +215,8 @@ async function challengeFromHomepage(): Promise<ChallengeData | undefined> {
       return undefined;
     }
 
-    const interpreterUrlWrapped =
-      bgChallenge?.interpreterUrl?.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue;
-    let interpreterJS: string | undefined =
-      bgChallenge?.interpreterJavascript?.privateDoNotAccessOrElseSafeScriptWrappedValue;
-    if (!interpreterJS) {
-      if (!interpreterUrlWrapped) {
-        log('homepage challenge: no interpreter available');
-        return undefined;
-      }
-      const jsRes = await fetch(`https:${interpreterUrlWrapped}`, { signal: timeout(CHALLENGE_TIMEOUT_MS) });
-      interpreterJS = await jsRes.text();
-    }
-    return { program: bgChallenge.program, globalName: bgChallenge.globalName, interpreterJS, ytcfg };
+    const interpreterJS = await obtainInterpreterJS(bgChallenge);
+    return { program: bgChallenge.program, globalName: bgChallenge.globalName, interpreterJS, ytcfg: homepageYtcfg };
   } catch (err: any) {
     log(`homepage challenge fetch failed: ${err?.message ?? err}`);
     return undefined;
@@ -199,6 +229,7 @@ async function challengeFromAttGet(): Promise<ChallengeData | undefined> {
     const res = await fetch('https://www.youtube.com/youtubei/v1/att/get?prettyPrint=false', {
       method: 'POST',
       headers: waaHeaders(),
+      credentials: 'omit',
       signal: timeout(CHALLENGE_TIMEOUT_MS),
       body: JSON.stringify({
         context: { client: { clientName: 'WEB', clientVersion: '2.20260817.01.00' } },
@@ -210,15 +241,7 @@ async function challengeFromAttGet(): Promise<ChallengeData | undefined> {
     const bgChallenge = attestation?.bgChallenge;
     if (!bgChallenge?.program || !bgChallenge?.globalName) throw new Error('no bgChallenge');
 
-    const interpreterUrlWrapped =
-      bgChallenge?.interpreterUrl?.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue;
-    let interpreterJS: string | undefined =
-      bgChallenge?.interpreterJavascript?.privateDoNotAccessOrElseSafeScriptWrappedValue;
-    if (!interpreterJS) {
-      if (!interpreterUrlWrapped) throw new Error('no interpreter available');
-      const jsRes = await fetch(`https:${interpreterUrlWrapped}`, { signal: timeout(CHALLENGE_TIMEOUT_MS) });
-      interpreterJS = await jsRes.text();
-    }
+    const interpreterJS = await obtainInterpreterJS(bgChallenge);
     return { program: bgChallenge.program, globalName: bgChallenge.globalName, interpreterJS, ytcfg: null };
   } catch (err: any) {
     log(`att/get challenge failed: ${err?.message ?? err}`);
@@ -232,6 +255,9 @@ async function mintWithChallenge(challenge: ChallengeData, visitorData: string):
     (window as any).yt = { config_: challenge.ytcfg };
   }
   if (!(window as any)[challenge.globalName]) {
+    if (!challenge.interpreterJS) {
+      throw new Error(`interpreter global '${challenge.globalName}' missing and no script text to eval`);
+    }
     new Function(challenge.interpreterJS)();
   }
   if (!(window as any)[challenge.globalName]) {
